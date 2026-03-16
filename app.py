@@ -53,11 +53,54 @@ def detect_languages(text):
     return [], False
 
 
+def detect_document_reference(text):
+    """
+    检测用户输入中是否包含对之前文档的引用
+    如"上面的文档"、"这个文件"等
+    """
+    # 文档引用关键词
+    doc_keywords = [
+        "上面的文档", "上面的文件", "上面的csv", "上面的数据",
+        "这个文档", "这个文件", "这个csv", "这份文件", "这份文档",
+        "之前的文档", "之前的文件", "之前的csv", "之前的数据",
+        "刚才的文档", "刚才的文件", "刚才的csv",
+        "那个文档", "那个文件", "那个csv",
+        "上传的文档", "上传的文件", "上传的csv",
+        "再翻译", "继续翻译", "重新翻译"
+    ]
+    
+    text_lower = text.lower()
+    is_doc_reference = any(k in text_lower for k in doc_keywords)
+    
+    return is_doc_reference
+
+
 def find_text_column(df):
     for col in df.columns:
         if any(k in str(col).lower() for k in ["中文", "内容", "文本", "原文", "text"]):
             return col
     return df.columns[0]
+
+
+def get_data_source(uploaded_file, use_history=False):
+    """
+    获取数据源：优先使用上传的文件，如果没有则从历史记录获取
+    """
+    # 如果有新上传的文件，优先使用
+    if uploaded_file is not None and not use_history:
+        df = read_csv_with_encoding(uploaded_file)
+        col = find_text_column(df)
+        return df, col, "新上传的文件"
+    
+    # 尝试从历史记录获取原始数据
+    if st.session_state.translation_history:
+        last_item = st.session_state.translation_history[-1]
+        if "source_df" in last_item:
+            df = last_item["source_df"].copy()
+            col = last_item.get("text_col", find_text_column(df))
+            return df, col, "历史记录中的文档"
+    
+    return None, None, None
 
 
 def translate_batch(texts, target_lang):
@@ -243,79 +286,96 @@ if user_input := st.chat_input("输入翻译需求..."):
         if not api_key:
             st.warning("⚠️ 请输入 API Key")
             st.session_state.messages.append({"role": "assistant", "content": "⚠️ 请输入 API Key"})
-        elif not uploaded_file:
-            st.warning("⚠️ 请上传 CSV 文件")
-            st.session_state.messages.append({"role": "assistant", "content": "⚠️ 请上传 CSV 文件"})
         else:
-            langs, is_context = detect_languages(user_input)
+            # 检测是否包含文档引用
+            is_doc_ref = detect_document_reference(user_input)
             
-            if not langs:
-                st.info("🤔 我只能帮你进行翻译哦，快告诉我你需要翻译成什么语言吧")
-                # 添加助手回复到消息历史
-                st.session_state.messages.append({
-                    "role": "assistant", 
-                    "content": "🤔 我只能帮你进行翻译哦，快告诉我你需要翻译成什么语言吧"
-                })
+            # 检查是否有上传文件或历史记录可用
+            has_uploaded_file = uploaded_file is not None
+            has_history = bool(st.session_state.translation_history)
+            
+            if not has_uploaded_file and not has_history:
+                st.warning("⚠️ 请上传 CSV 文件")
+                st.session_state.messages.append({"role": "assistant", "content": "⚠️ 请上传 CSV 文件"})
             else:
-                # 如果是上下文引用，显示提示
-                if is_context:
-                    st.info(f"💡 使用你之前提到的语言：{', '.join(langs)}")
+                # 使用数据源（上传的文件或历史记录）
+                use_history = is_doc_ref and not has_uploaded_file and has_history
+                df, col, source_info = get_data_source(uploaded_file, use_history=use_history)
+                
+                if df is None:
+                    st.error("❌ 无法获取数据源")
+                    st.session_state.messages.append({"role": "assistant", "content": "❌ 无法获取数据源"})
                 else:
-                    st.success(f"🎯 {', '.join(langs)}")
-                
-                # 保存当前语言到 session_state（记忆功能）
-                st.session_state.last_langs = langs
-                
-                try:
-                    df = read_csv_with_encoding(uploaded_file)
-                    col = find_text_column(df)
+                    langs, is_context = detect_languages(user_input)
                     
-                    st.caption(f"📄 {col} | {len(df)} 行")
-                    
-                    with st.expander("预览"):
-                        st.dataframe(df[[col]].head(3), use_container_width=True)
-                    
-                    with st.spinner("翻译中..."):
-                        result = process_translation(df, col, langs, api_key)
-                    
-                    # 保存到历史记录，并记录索引
-                    history_item = {
-                        "langs": langs,
-                        "result": result,
-                        "text_col": col,
-                        "timestamp": pd.Timestamp.now().strftime("%H:%M:%S")
-                    }
-                    st.session_state.translation_history.append(history_item)
-                    
-                    st.success(f"✅ 完成！{len(df)} 条 → {len(langs)} 种语言")
-                    
-                    # 将结果预览和下载嵌入到当前助手消息中
-                    with st.expander("📊 结果预览", expanded=True):
-                        st.dataframe(result.head(5), use_container_width=True)
+                    if not langs:
+                        st.info("🤔 我只能帮你进行翻译哦，快告诉我你需要翻译成什么语言吧")
+                        st.session_state.messages.append({
+                            "role": "assistant", 
+                            "content": "🤔 我只能帮你进行翻译哦，快告诉我你需要翻译成什么语言吧"
+                        })
+                    else:
+                        # 显示数据源信息
+                        if use_history:
+                            st.info(f"📂 自动使用{source_info}")
                         
-                        csv = result.to_csv(index=False, encoding='utf-8-sig')
-                        st.download_button(
-                            label="⬇️ 下载翻译结果",
-                            data=csv,
-                            file_name=f"translated_{len(st.session_state.translation_history)}_{'_'.join(langs)}.csv",
-                            mime="text/csv",
-                            key=f"download_{history_item['timestamp']}"
-                        )
-                    
-                    # 记录此消息对应的历史索引
-                    history_idx = len(st.session_state.translation_history) - 1
-                    response_content = f"✅ 完成！已将 {col} 翻译成 {', '.join(langs)}，共 {len(df)} 条数据。"
-                    
-                except Exception as e:
-                    st.error(f"错误：{e}")
-                    response_content = f"❌ 处理过程中出现错误：{e}"
-                
-                # 将助手回复添加到消息历史（包含历史记录索引）
-                st.session_state.messages.append({
-                    "role": "assistant", 
-                    "content": response_content if 'response_content' in locals() else "处理完成",
-                    "history_idx": history_idx if 'history_idx' in locals() else None
-                })
+                        # 如果是上下文引用，显示提示
+                        if is_context:
+                            st.info(f"💡 使用你之前提到的语言：{', '.join(langs)}")
+                        else:
+                            st.success(f"🎯 {', '.join(langs)}")
+                        
+                        # 保存当前语言到 session_state
+                        st.session_state.last_langs = langs
+                        
+                        try:
+                            st.caption(f"📄 {col} | {len(df)} 行")
+                            
+                            with st.expander("预览"):
+                                st.dataframe(df[[col]].head(3), use_container_width=True)
+                            
+                            with st.spinner("翻译中..."):
+                                result = process_translation(df, col, langs, api_key)
+                            
+                            # 保存到历史记录，包含原始数据
+                            history_item = {
+                                "langs": langs,
+                                "result": result,
+                                "source_df": df,  # 保存原始数据以便复用
+                                "text_col": col,
+                                "timestamp": pd.Timestamp.now().strftime("%H:%M:%S")
+                            }
+                            st.session_state.translation_history.append(history_item)
+                            
+                            st.success(f"✅ 完成！{len(df)} 条 → {len(langs)} 种语言")
+                            
+                            # 将结果预览和下载嵌入到当前助手消息中
+                            with st.expander("📊 结果预览", expanded=True):
+                                st.dataframe(result.head(5), use_container_width=True)
+                                
+                                csv = result.to_csv(index=False, encoding='utf-8-sig')
+                                st.download_button(
+                                    label="⬇️ 下载翻译结果",
+                                    data=csv,
+                                    file_name=f"translated_{len(st.session_state.translation_history)}_{'_'.join(langs)}.csv",
+                                    mime="text/csv",
+                                    key=f"download_{history_item['timestamp']}"
+                                )
+                            
+                            # 记录此消息对应的历史索引
+                            history_idx = len(st.session_state.translation_history) - 1
+                            response_content = f"✅ 完成！已将 {col} 翻译成 {', '.join(langs)}，共 {len(df)} 条数据。"
+                            
+                        except Exception as e:
+                            st.error(f"错误：{e}")
+                            response_content = f"❌ 处理过程中出现错误：{e}"
+                        
+                        # 将助手回复添加到消息历史
+                        st.session_state.messages.append({
+                            "role": "assistant", 
+                            "content": response_content if 'response_content' in locals() else "处理完成",
+                            "history_idx": history_idx if 'history_idx' in locals() else None
+                        })
         
         # 重新运行以显示新消息
         st.rerun()
